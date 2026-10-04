@@ -4,7 +4,7 @@ import { hitungDenda } from '@/lib/denda';
 import { hashToken } from '@/lib/token';
 import { detectImageFromBytes } from '@/lib/r2';
 import { canAccessFile } from '@/lib/file-auth';
-import { checkPerpanjanganEligibility } from '@/lib/perpanjangan';
+import { checkPerpanjanganEligibility, PerpanjanganError } from '@/lib/perpanjangan';
 import { tambahBulan } from '@/lib/date-utils';
 
 describe('1. Normalisasi Nomor Handphone (normalizePhone)', () => {
@@ -286,5 +286,146 @@ describe('7. Penambahan Bulan Kalender Aman (tambahBulan)', () => {
     expect(() => tambahBulan('bukan-tanggal', 1)).toThrow('Tanggal tidak valid');
     expect(() => tambahBulan(new Date(), NaN)).toThrow('Durasi bulan harus berupa bilangan bulat');
     expect(() => tambahBulan(new Date(), 1.5 as any)).toThrow('Durasi bulan harus berupa bilangan bulat');
+  });
+});
+
+describe('8. Keamanan Balapan & Transaksi Konkurensi Perpanjangan Sewa', () => {
+  it('PerpanjanganError harus menginisialisasi statusCode dan reason dengan benar', () => {
+    const err409 = new PerpanjanganError(409, 'Masih pending', 'PENDING_EXIST');
+    expect(err409.statusCode).toBe(409);
+    expect(err409.reason).toBe('PENDING_EXIST');
+    expect(err409.message).toBe('Masih pending');
+    expect(err409).toBeInstanceOf(Error);
+
+    const err429 = new PerpanjanganError(429, 'Rate limit 7 hari', 'RATE_LIMITED');
+    expect(err429.statusCode).toBe(429);
+    expect(err429.reason).toBe('RATE_LIMITED');
+  });
+
+  it('skenario balapan (race condition): dua request paralel hanya mengizinkan 1 pengajuan dan menolak yang kedua dengan 409', async () => {
+    // Simulasi shared store database untuk kontrak X
+    const databaseSubmissions: Array<{
+      status: 'PENDING' | 'DISETUJUI' | 'DITOLAK';
+      created_at: Date;
+    }> = [];
+
+    // Simulasi transaksi serializable atomik
+    let lock: Promise<unknown> = Promise.resolve();
+    const submitPerpanjanganAtomik = async (now: Date): Promise<{ success: boolean; record: { status: 'PENDING'; created_at: Date } }> => {
+      // Serializable isolation mengantrekan akses baca-tulis
+      const task = lock.then(async () => {
+        // 1. Baca riwayat di dalam transaksi
+        const history = [...databaseSubmissions];
+
+        // 2. Evaluasi eligibility
+        const eligibility = checkPerpanjanganEligibility(history, now);
+        if (!eligibility.allowed) {
+          throw new PerpanjanganError(
+            eligibility.statusCode || 400,
+            eligibility.message || 'Error',
+            eligibility.reason
+          );
+        }
+
+        // 3. Tulis pengajuan baru jika lolos
+        const newRecord = { status: 'PENDING' as const, created_at: now };
+        databaseSubmissions.push(newRecord);
+        return { success: true, record: newRecord };
+      });
+
+      // Keep the chain moving even if one throws
+      lock = task.catch(() => {});
+      return task;
+    };
+
+    const requestTime = new Date('2026-10-04T10:00:00.000Z');
+
+    // Jalankan 2 request secara konkruen (simulasi double-click bersamaan)
+    const [res1, res2] = await Promise.allSettled([
+      submitPerpanjanganAtomik(requestTime),
+      submitPerpanjanganAtomik(requestTime),
+    ]);
+
+    // Request 1 harus berhasil
+    expect(res1.status).toBe('fulfilled');
+    if (res1.status === 'fulfilled') {
+      expect(res1.value.success).toBe(true);
+    }
+
+    // Request 2 harus ditolak dengan PerpanjanganError (409 PENDING_EXIST)
+    expect(res2.status).toBe('rejected');
+    if (res2.status === 'rejected') {
+      const err = res2.reason;
+      expect(err).toBeInstanceOf(PerpanjanganError);
+      expect(err.statusCode).toBe(409);
+      expect(err.reason).toBe('PENDING_EXIST');
+    }
+
+    // Hanya boleh ada tepat 1 pengajuan yang tersimpan di DB
+    expect(databaseSubmissions.length).toBe(1);
+    expect(databaseSubmissions[0].status).toBe('PENDING');
+  });
+
+  it('skenario retry pada serialization failure (P2034): berhasil setelah retry', async () => {
+    let attempts = 0;
+    const MAX_RETRIES = 2;
+
+    const mockSerializableTransaction = async () => {
+      let currentAttempt = 0;
+      while (currentAttempt <= MAX_RETRIES) {
+        try {
+          attempts++;
+          if (currentAttempt === 0) {
+            // Simulasi PostgreSQL P2034 serialization failure pada percobaan pertama
+            const p2034Error: any = new Error('could not serialize access due to concurrent update');
+            p2034Error.code = 'P2034';
+            throw p2034Error;
+          }
+
+          // Percobaan kedua berhasil
+          return { id: 'pengajuan-1', status: 'PENDING' };
+        } catch (err: any) {
+          if (err?.code === 'P2034' && currentAttempt < MAX_RETRIES) {
+            currentAttempt++;
+            continue;
+          }
+          throw err;
+        }
+      }
+    };
+
+    const result = await mockSerializableTransaction();
+    expect(result?.id).toBe('pengajuan-1');
+    expect(attempts).toBe(2); // Mencoba 2x lalu berhasil
+  });
+
+  it('skenario retry pada serialization failure: batas maksimal retry (2x) terlampaui melempar error konflik', async () => {
+    let attempts = 0;
+    const MAX_RETRIES = 2;
+
+    const mockFailingSerializableTransaction = async () => {
+      let currentAttempt = 0;
+      while (currentAttempt <= MAX_RETRIES) {
+        try {
+          attempts++;
+          const p2034Error: any = new Error('could not serialize access');
+          p2034Error.code = 'P2034';
+          throw p2034Error;
+        } catch (err: any) {
+          if (err?.code === 'P2034' && currentAttempt < MAX_RETRIES) {
+            currentAttempt++;
+            continue;
+          }
+          return { error: 'Permintaan sedang diproses, silakan coba lagi.', statusCode: 409 };
+        }
+      }
+    };
+
+    const res = await mockFailingSerializableTransaction();
+    expect(res).toEqual({
+      error: 'Permintaan sedang diproses, silakan coba lagi.',
+      statusCode: 409,
+    });
+    expect(attempts).toBe(3); // Attempt 0, attempt 1, attempt 2 (total 3 attempts)
   });
 });

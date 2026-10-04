@@ -7,6 +7,18 @@ export interface PerpanjanganEligibilityResult {
   message?: string;
 }
 
+export class PerpanjanganError extends Error {
+  statusCode: number;
+  reason?: 'PENDING_EXIST' | 'RATE_LIMITED';
+
+  constructor(statusCode: number, message: string, reason?: 'PENDING_EXIST' | 'RATE_LIMITED') {
+    super(message);
+    this.name = 'PerpanjanganError';
+    this.statusCode = statusCode;
+    this.reason = reason;
+  }
+}
+
 /**
  * Pure function to check whether a contract is eligible for lease extension submission.
  * Rule:

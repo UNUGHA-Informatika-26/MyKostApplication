@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAuthApi, requireRoleApi } from '@/lib/rbac';
-import { Role, StatusPengajuanPerpanjangan } from '@prisma/client';
+import { Prisma, Role, StatusPengajuanPerpanjangan } from '@prisma/client';
 import { logAktivitas } from '@/lib/log';
 import { handleApiError } from '@/lib/errors';
-import { checkPerpanjanganEligibility } from '@/lib/perpanjangan';
+import { checkPerpanjanganEligibility, PerpanjanganError } from '@/lib/perpanjangan';
 
 export async function GET() {
   try {
@@ -80,50 +80,101 @@ export async function POST() {
       );
     }
 
-    // Retrieve all previous extension requests for this contract to check rate limit and duplicates
-    const previousSubmissions = await prisma.pengajuanPerpanjangan.findMany({
-      where: { kontrak_id: activeKontrak.id },
-      select: { status: true, created_at: true },
-    });
+    const MAX_RETRIES = 2;
+    let attempt = 0;
+    let pengajuanResult: any = null;
 
-    const eligibility = checkPerpanjanganEligibility(previousSubmissions);
-    if (!eligibility.allowed) {
-      return NextResponse.json(
-        { error: eligibility.message },
-        { status: eligibility.statusCode || 400 }
-      );
+    while (attempt <= MAX_RETRIES) {
+      try {
+        pengajuanResult = await prisma.$transaction(
+          async (tx) => {
+            // 1. Ambil riwayat pengajuan kontrak_id di dalam transaksi serializable
+            const previousSubmissions = await tx.pengajuanPerpanjangan.findMany({
+              where: { kontrak_id: activeKontrak.id },
+              select: { status: true, created_at: true },
+            });
+
+            // 2. Cek eligibility (jika ada PENDING lempar 409, jika < 7 hari lempar 429)
+            const eligibility = checkPerpanjanganEligibility(previousSubmissions);
+            if (!eligibility.allowed) {
+              throw new PerpanjanganError(
+                eligibility.statusCode || 400,
+                eligibility.message || 'Pengajuan tidak dapat diproses saat ini.',
+                eligibility.reason
+              );
+            }
+
+            // 3. Buat pengajuan baru
+            const pengajuan = await tx.pengajuanPerpanjangan.create({
+              data: {
+                kontrak_id: activeKontrak.id,
+                penghuni_id: penghuni.id,
+                status: StatusPengajuanPerpanjangan.PENDING,
+              },
+            });
+
+            // 4. Cari manajer (OWNER & ADMIN) dan buat notifikasi
+            const managers = await tx.user.findMany({
+              where: { role: { in: [Role.OWNER, Role.ADMIN] } },
+              select: { id: true },
+            });
+
+            const pesanNotifikasi = `Penghuni ${session.nama} (Kamar ${activeKontrak.kamar.nomor_kamar}) mengajukan perpanjangan sewa`;
+
+            if (managers.length > 0) {
+              await tx.notifikasi.createMany({
+                data: managers.map((mgr) => ({
+                  user_id: mgr.id,
+                  judul: 'Pengajuan Perpanjangan Sewa',
+                  pesan: pesanNotifikasi,
+                  tipe: 'KONTRAK',
+                })),
+              });
+            }
+
+            return pengajuan;
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+          }
+        );
+
+        // Berhasil, keluar dari retry loop
+        break;
+      } catch (err: any) {
+        // Tangani error eligibility: jika PENDING lempar 409, jika < 7 hari lempar 429 (tanpa retry)
+        if (err instanceof PerpanjanganError) {
+          return NextResponse.json({ error: err.message }, { status: err.statusCode });
+        }
+
+        // Tangani Prisma serialization conflict (P2034) dengan retry
+        const isSerializationError =
+          err?.code === 'P2034' ||
+          (typeof err?.message === 'string' &&
+            (err.message.includes('could not serialize access') ||
+              err.message.includes('deadlock detected') ||
+              err.message.includes('P2034')));
+
+        if (isSerializationError && attempt < MAX_RETRIES) {
+          attempt++;
+          // Jitter backoff sebelum mencoba lagi
+          await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+          continue;
+        }
+
+        if (isSerializationError) {
+          return NextResponse.json(
+            { error: 'Permintaan sedang diproses, silakan coba lagi.' },
+            { status: 409 }
+          );
+        }
+
+        // Error lain dilempar ke catch luar
+        throw err;
+      }
     }
 
-    // Find all OWNER & ADMIN users to notify
-    const managers = await prisma.user.findMany({
-      where: { role: { in: [Role.OWNER, Role.ADMIN] } },
-      select: { id: true },
-    });
-
-    const pesanNotifikasi = `Penghuni ${session.nama} (Kamar ${activeKontrak.kamar.nomor_kamar}) mengajukan perpanjangan sewa`;
-
-    // Atomic transaction: create PengajuanPerpanjangan record & notifications for managers
-    const [pengajuan] = await prisma.$transaction([
-      prisma.pengajuanPerpanjangan.create({
-        data: {
-          kontrak_id: activeKontrak.id,
-          penghuni_id: penghuni.id,
-          status: StatusPengajuanPerpanjangan.PENDING,
-        },
-      }),
-      ...managers.map((mgr) =>
-        prisma.notifikasi.create({
-          data: {
-            user_id: mgr.id,
-            judul: 'Pengajuan Perpanjangan Sewa',
-            pesan: pesanNotifikasi,
-            tipe: 'KONTRAK',
-          },
-        })
-      ),
-    ]);
-
-    // Log activity
+    // Log aktivitas setelah transaksi berhasil
     await logAktivitas(
       session.id,
       'ajukan_perpanjangan_sewa',
@@ -133,7 +184,7 @@ export async function POST() {
     return NextResponse.json({
       success: true,
       message: 'Pengajuan perpanjangan sewa berhasil dikirimkan ke pengelola kost.',
-      pengajuan,
+      pengajuan: pengajuanResult,
     });
   } catch (error: any) {
     return handleApiError(error, 'Gagal mengajukan perpanjangan sewa');
