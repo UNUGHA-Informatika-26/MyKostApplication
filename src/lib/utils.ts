@@ -116,3 +116,5 @@ export function formatDateRange(startInput: Date | string, endInput: Date | stri
   return `${formatDateShortIndonesian(startInput)} – ${formatDateShortIndonesian(endInput)}`;
 }
 
+export { tambahBulan } from './date-utils';
+

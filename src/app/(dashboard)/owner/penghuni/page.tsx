@@ -70,6 +70,7 @@ export default function OwnerPenghuniPage() {
 
   const [modalLoading, setModalLoading] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [durasiPerpanjangan, setDurasiPerpanjangan] = useState<Record<string, number>>({});
 
   useEffect(() => {
     fetchData();
@@ -197,23 +198,38 @@ export default function OwnerPenghuniPage() {
     pengajuanId: string,
     status: 'DISETUJUI' | 'DITOLAK'
   ) => {
-    const actionLabel = status === 'DISETUJUI' ? 'menyetujui' : 'menolak';
-    if (!window.confirm(`Apakah Anda yakin ingin ${actionLabel} pengajuan perpanjangan sewa ini?`)) {
-      return;
+    const durasi = durasiPerpanjangan[pengajuanId] ?? 1;
+    let catatan: string | null = null;
+
+    if (status === 'DISETUJUI') {
+      if (!window.confirm(`Apakah Anda yakin ingin menyetujui perpanjangan sewa ini selama ${durasi} bulan?`)) {
+        return;
+      }
+    } else {
+      const promptedCatatan = window.prompt('Masukkan catatan penolakan (opsional):', '');
+      if (promptedCatatan === null) {
+        // Owner clicked cancel
+        return;
+      }
+      catatan = promptedCatatan.trim() || null;
     }
 
     try {
       const res = await fetch(`/api/kontrak/perpanjangan/${pengajuanId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({
+          status,
+          durasi_bulan: status === 'DISETUJUI' ? durasi : undefined,
+          catatan,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'Gagal memproses verifikasi');
       }
 
-      setToastMessage(`Pengajuan perpanjangan sewa berhasil ${status === 'DISETUJUI' ? 'disetujui' : 'ditolak'}.`);
+      setToastMessage(data.message || `Pengajuan perpanjangan sewa berhasil ${status === 'DISETUJUI' ? 'disetujui' : 'ditolak'}.`);
       setTimeout(() => setToastMessage(null), 5000);
       fetchData();
     } catch (err: any) {
@@ -320,45 +336,64 @@ export default function OwnerPenghuniPage() {
                         </span>
                       )}
                     </p>
-                    {activeKontrak.pengajuan_perpanjangan?.[0] && (
-                      <div className="p-2.5 bg-amber-50 border border-amber-200/80 rounded-xl space-y-2 mt-2">
-                        <div className="flex items-center justify-between text-[11px]">
-                          <span className="font-bold text-amber-900 flex items-center gap-1">
-                            <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                            Pengajuan Perpanjangan Sewa
-                          </span>
-                          <span className="font-bold text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded-md">
-                            Menunggu
-                          </span>
+                    {activeKontrak.pengajuan_perpanjangan?.[0] && (() => {
+                      const pengajuan = activeKontrak.pengajuan_perpanjangan[0];
+                      const durasi = durasiPerpanjangan[pengajuan.id] ?? 1;
+                      return (
+                        <div className="p-2.5 bg-amber-50 border border-amber-200/80 rounded-xl space-y-2 mt-2">
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span className="font-bold text-amber-900 flex items-center gap-1">
+                              <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                              Pengajuan Perpanjangan Sewa
+                            </span>
+                            <span className="font-bold text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded-md">
+                              Menunggu
+                            </span>
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2 bg-white/80 px-2.5 py-1.5 rounded-lg border border-amber-200/60 text-[11px]">
+                            <label htmlFor={`durasi-${pengajuan.id}`} className="font-semibold text-slate-700">
+                              Durasi Perpanjangan:
+                            </label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                id={`durasi-${pengajuan.id}`}
+                                type="number"
+                                min={1}
+                                max={24}
+                                value={durasi}
+                                onChange={(e) => {
+                                  const val = parseInt(e.target.value, 10);
+                                  setDurasiPerpanjangan((prev) => ({
+                                    ...prev,
+                                    [pengajuan.id]: isNaN(val) ? 1 : Math.max(1, Math.min(24, val)),
+                                  }));
+                                }}
+                                className="w-14 px-2 py-0.5 bg-white border border-slate-300 rounded-md text-center font-bold text-slate-800 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                              />
+                              <span className="text-slate-500 font-medium">Bulan</span>
+                            </div>
+                          </div>
+
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleVerifikasiPerpanjangan(pengajuan.id, 'DISETUJUI')}
+                              className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold rounded-lg transition-all text-[11px] cursor-pointer"
+                            >
+                              Setujui
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleVerifikasiPerpanjangan(pengajuan.id, 'DITOLAK')}
+                              className="flex-1 py-1.5 bg-slate-200 hover:bg-slate-300 active:scale-95 text-slate-700 font-bold rounded-lg transition-all text-[11px] cursor-pointer"
+                            >
+                              Tolak
+                            </button>
+                          </div>
                         </div>
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleVerifikasiPerpanjangan(
-                                activeKontrak.pengajuan_perpanjangan![0].id,
-                                'DISETUJUI'
-                              )
-                            }
-                            className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold rounded-lg transition-all text-[11px] cursor-pointer"
-                          >
-                            Setujui
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleVerifikasiPerpanjangan(
-                                activeKontrak.pengajuan_perpanjangan![0].id,
-                                'DITOLAK'
-                              )
-                            }
-                            className="flex-1 py-1.5 bg-slate-200 hover:bg-slate-300 active:scale-95 text-slate-700 font-bold rounded-lg transition-all text-[11px] cursor-pointer"
-                          >
-                            Tolak
-                          </button>
-                        </div>
-                      </div>
-                    )}
+                      );
+                    })()}
 
                     <div className="pt-1">
                       <button

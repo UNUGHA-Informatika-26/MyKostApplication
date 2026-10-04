@@ -5,6 +5,7 @@ import { hashToken } from '@/lib/token';
 import { detectImageFromBytes } from '@/lib/r2';
 import { canAccessFile } from '@/lib/file-auth';
 import { checkPerpanjanganEligibility } from '@/lib/perpanjangan';
+import { tambahBulan } from '@/lib/date-utils';
 
 describe('1. Normalisasi Nomor Handphone (normalizePhone)', () => {
   it('harus mempertahankan format standar 08xxxxxxxxxx', () => {
@@ -211,5 +212,79 @@ describe('6. Aturan Rate Limit & Duplikat Perpanjangan Sewa (checkPerpanjanganEl
       now
     );
     expect(res.allowed).toBe(true);
+  });
+});
+
+describe('7. Penambahan Bulan Kalender Aman (tambahBulan)', () => {
+  it('harus menambahkan bulan normal dengan tanggal yang sama (15 Jan -> 15 Apr)', () => {
+    const awal = new Date('2026-01-15T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 3);
+    expect(hasil.toISOString()).toBe('2026-04-15T00:00:00.000Z');
+  });
+
+  it('akhir bulan pada tahun kabisat (leap year): 31 Jan 2024 + 1 bulan harus menjadi 29 Feb 2024', () => {
+    const awal = new Date('2024-01-31T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 1);
+    expect(hasil.toISOString()).toBe('2024-02-29T00:00:00.000Z');
+    expect(hasil.getUTCDate()).toBe(29);
+    expect(hasil.getUTCMonth()).toBe(1); // Februari
+  });
+
+  it('akhir bulan pada tahun non-kabisat: 31 Jan 2025 + 1 bulan harus menjadi 28 Feb 2025', () => {
+    const awal = new Date('2025-01-31T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 1);
+    expect(hasil.toISOString()).toBe('2025-02-28T00:00:00.000Z');
+    expect(hasil.getUTCDate()).toBe(28);
+    expect(hasil.getUTCMonth()).toBe(1); // Februari
+  });
+
+  it('hari kabisat ke tahun non-kabisat: 29 Feb 2024 + 12 bulan harus menjadi 28 Feb 2025', () => {
+    const awal = new Date('2024-02-29T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 12);
+    expect(hasil.toISOString()).toBe('2025-02-28T00:00:00.000Z');
+    expect(hasil.getUTCDate()).toBe(28);
+    expect(hasil.getUTCMonth()).toBe(1);
+    expect(hasil.getUTCFullYear()).toBe(2025);
+  });
+
+  it('penyesuaian dari bulan 31 hari ke bulan 30 hari (31 Agu -> 30 Sep, 31 Mei -> 30 Jun)', () => {
+    const agu = new Date('2026-08-31T00:00:00.000Z');
+    const sep = tambahBulan(agu, 1);
+    expect(sep.toISOString()).toBe('2026-09-30T00:00:00.000Z');
+
+    const mei = new Date('2026-05-31T00:00:00.000Z');
+    const jun = tambahBulan(mei, 1);
+    expect(jun.toISOString()).toBe('2026-06-30T00:00:00.000Z');
+  });
+
+  it('melewati pergantian tahun dengan benar (30 Nov 2026 + 3 bulan -> 28 Feb 2027)', () => {
+    const awal = new Date('2026-11-30T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 3);
+    expect(hasil.toISOString()).toBe('2027-02-28T00:00:00.000Z');
+    expect(hasil.getUTCFullYear()).toBe(2027);
+  });
+
+  it('mendukung durasi maksimal 24 bulan (1 Jan 2026 + 24 bulan -> 1 Jan 2028)', () => {
+    const awal = new Date('2026-01-01T00:00:00.000Z');
+    const hasil = tambahBulan(awal, 24);
+    expect(hasil.toISOString()).toBe('2028-01-01T00:00:00.000Z');
+    expect(hasil.getUTCFullYear()).toBe(2028);
+  });
+
+  it('mempertahankan komponen jam, menit, dan detik', () => {
+    const awal = new Date('2026-01-31T15:45:30.500Z');
+    const hasil = tambahBulan(awal, 1);
+    expect(hasil.toISOString()).toBe('2026-02-28T15:45:30.500Z');
+  });
+
+  it('menerima input string format tanggal YYYY-MM-DD', () => {
+    const hasil = tambahBulan('2024-01-31', 1);
+    expect(hasil.toISOString()).toBe('2024-02-29T00:00:00.000Z');
+  });
+
+  it('harus menolak input durasi atau tanggal yang tidak valid', () => {
+    expect(() => tambahBulan('bukan-tanggal', 1)).toThrow('Tanggal tidak valid');
+    expect(() => tambahBulan(new Date(), NaN)).toThrow('Durasi bulan harus berupa bilangan bulat');
+    expect(() => tambahBulan(new Date(), 1.5 as any)).toThrow('Durasi bulan harus berupa bilangan bulat');
   });
 });
